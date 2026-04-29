@@ -3,6 +3,7 @@ import os
 import re
 from urllib.parse import parse_qs, urlparse
 
+import requests
 from fastapi import Depends, FastAPI, HTTPException, Query
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from youtube_transcript_api import (
@@ -61,11 +62,39 @@ def extract_video_id(url_or_id: str) -> str:
 
 
 TRANSCRIPT_TIMEOUT = float(os.environ.get("TRANSCRIPT_TIMEOUT", "30"))
+TITLE_TIMEOUT = float(os.environ.get("TITLE_TIMEOUT", "5"))
 
 
 def _fetch(video_id: str, languages: list[str]):
     transcript = YouTubeTranscriptApi(proxy_config=_proxy_config()).fetch(video_id, languages=languages)
     return transcript
+
+
+def _requests_proxies() -> dict[str, str] | None:
+    webshare_user = os.environ.get("WEBSHARE_PROXY_USERNAME", "").strip()
+    webshare_pass = os.environ.get("WEBSHARE_PROXY_PASSWORD", "").strip()
+    if webshare_user and webshare_pass:
+        url = f"http://{webshare_user}:{webshare_pass}@p.webshare.io:80"
+        return {"http": url, "https": url}
+    url = os.environ.get("PROXY_URL", "").strip()
+    if url:
+        return {"http": url, "https": url}
+    return None
+
+
+def _fetch_title(video_id: str) -> str | None:
+    try:
+        resp = requests.get(
+            "https://www.youtube.com/oembed",
+            params={"url": f"https://www.youtube.com/watch?v={video_id}", "format": "json"},
+            timeout=TITLE_TIMEOUT,
+            proxies=_requests_proxies(),
+        )
+        if resp.status_code != 200:
+            return None
+        return resp.json().get("title")
+    except (requests.RequestException, ValueError):
+        return None
 
 
 @app.get("/transcript")
@@ -80,27 +109,40 @@ async def get_transcript(
         raise HTTPException(status_code=400, detail=str(e))
 
     loop = asyncio.get_event_loop()
+    title_task = loop.run_in_executor(None, lambda: _fetch_title(video_id))
     try:
         transcript = await asyncio.wait_for(
             loop.run_in_executor(None, lambda: _fetch(video_id, languages)),
             timeout=TRANSCRIPT_TIMEOUT,
         )
     except asyncio.TimeoutError:
+        title_task.cancel()
         raise HTTPException(status_code=504, detail="Transcript fetch timed out")
     except InvalidVideoId:
+        title_task.cancel()
         raise HTTPException(status_code=400, detail="Invalid video ID")
     except VideoUnavailable:
+        title_task.cancel()
         raise HTTPException(status_code=404, detail="Video is unavailable")
     except TranscriptsDisabled:
+        title_task.cancel()
         raise HTTPException(status_code=422, detail="Transcripts are disabled for this video")
     except NoTranscriptFound:
+        title_task.cancel()
         raise HTTPException(status_code=404, detail="No transcript found in requested languages")
     except CouldNotRetrieveTranscript as e:
+        title_task.cancel()
         raise HTTPException(status_code=502, detail=str(e))
+
+    try:
+        title = await asyncio.wait_for(title_task, timeout=TITLE_TIMEOUT)
+    except (asyncio.TimeoutError, asyncio.CancelledError):
+        title = None
 
     text = " ".join(snippet.text for snippet in transcript)
     return {
         "video_id": transcript.video_id,
+        "title": title,
         "language": transcript.language,
         "language_code": transcript.language_code,
         "is_generated": transcript.is_generated,
