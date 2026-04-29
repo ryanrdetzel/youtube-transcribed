@@ -12,8 +12,16 @@ from youtube_transcript_api import (
     VideoUnavailable,
     YouTubeTranscriptApi,
 )
+from youtube_transcript_api.proxies import GenericProxyConfig
 
 app = FastAPI(title="youtube-transcribed")
+
+
+def _proxy_config() -> GenericProxyConfig | None:
+    url = os.environ.get("PROXY_URL", "").strip()
+    if not url:
+        return None
+    return GenericProxyConfig(http_url=url, https_url=url)
 
 _bearer = HTTPBearer(auto_error=False)
 
@@ -59,7 +67,7 @@ def get_transcript(
         raise HTTPException(status_code=400, detail=str(e))
 
     try:
-        transcript = YouTubeTranscriptApi().fetch(video_id, languages=languages)
+        transcript = YouTubeTranscriptApi(proxy_config=_proxy_config()).fetch(video_id, languages=languages)
         text = " ".join(snippet.text for snippet in transcript)
         return {
             "video_id": transcript.video_id,
